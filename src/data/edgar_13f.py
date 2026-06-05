@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 NAMESPACE = "13f"
 
-USER_AGENT = "InstitutionalPressure/0.1 (research tool)"
+USER_AGENT = "InstitutionalPressure/0.1 (research@institutional-pressure.dev)"
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate"}
 
 # XML namespaces used in 13F info tables
@@ -92,8 +92,15 @@ def _get_13f_filings(cik: str, start_year: int = 2015) -> list[dict]:
 
 
 def _get_info_table_url(filing: dict) -> str | None:
-    """Find the infotable XML document URL within a 13F filing."""
-    cik = filing["cik"]
+    """Find the infotable XML document URL within a 13F filing.
+
+    The SEC filing index page lists all documents in the filing.
+    The info table XML can have various names (infotable.xml, or a numeric
+    ID like 53405.xml). We find it by looking for the second XML file that
+    isn't the primary_doc.xml (which is the cover page).
+    """
+    # CIK in archive URLs must NOT have leading zeros
+    cik = filing["cik"].lstrip("0")
     accession_clean = filing["accession"].replace("-", "")
     index_url = (
         f"https://www.sec.gov/Archives/edgar/data/{cik}/"
@@ -102,50 +109,42 @@ def _get_info_table_url(filing: dict) -> str | None:
 
     try:
         resp = _sec_get(index_url)
-        text = resp.text
-    except Exception:
-        # Try the JSON index instead
-        json_url = (
-            f"https://data.sec.gov/submissions/"
-            f"{filing['accession']}.json"
-        )
-        try:
-            resp = _sec_get(json_url)
-        except Exception as e:
-            logger.warning("Could not get filing index: %s", e)
-            return None
+    except Exception as e:
+        logger.warning("Could not get filing index for %s: %s", filing["accession"], e)
+        return None
 
-    # Look for the info table XML file in the filing index
-    # Common names: infotable.xml, primary_doc.xml, etc.
-    pattern = re.compile(
-        r'href="([^"]*(?:infotable|information_table|INFOTABLE)[^"]*\.xml)"',
-        re.IGNORECASE,
+    # Find all XML links in the filing index page.
+    # Exclude xslForm13F stylesheets — we want the raw XML.
+    all_xmls = re.findall(r'href="([^"]*\.xml)"', resp.text, re.IGNORECASE)
+    # Filter out stylesheet/transformed versions and keep raw files
+    raw_xmls = [
+        x for x in all_xmls
+        if "xslForm13F" not in x
+    ]
+
+    if not raw_xmls:
+        logger.warning("No XML files found in index for %s", filing["accession"])
+        return None
+
+    # The info table is the XML file that is NOT primary_doc.xml
+    # (primary_doc.xml is the cover page / form summary)
+    info_table_xmls = [x for x in raw_xmls if "primary_doc" not in x]
+
+    if info_table_xmls:
+        chosen = info_table_xmls[0]
+    else:
+        # If only primary_doc.xml exists, try it anyway
+        chosen = raw_xmls[0]
+
+    # Build full URL
+    if chosen.startswith("http"):
+        return chosen
+    if chosen.startswith("/"):
+        return f"https://www.sec.gov{chosen}"
+    return (
+        f"https://www.sec.gov/Archives/edgar/data/{cik}/"
+        f"{accession_clean}/{chosen}"
     )
-    match = pattern.search(resp.text)
-    if match:
-        rel_path = match.group(1)
-        if rel_path.startswith("http"):
-            return rel_path
-        return (
-            f"https://www.sec.gov/Archives/edgar/data/{cik}/"
-            f"{accession_clean}/{rel_path}"
-        )
-
-    # Fallback: try common naming patterns
-    for name in ["infotable.xml", "INFOTABLE.XML", "primary_doc.xml"]:
-        test_url = (
-            f"https://www.sec.gov/Archives/edgar/data/{cik}/"
-            f"{accession_clean}/{name}"
-        )
-        try:
-            test_resp = requests.head(test_url, headers=HEADERS, timeout=10)
-            if test_resp.status_code == 200:
-                return test_url
-        except Exception:
-            continue
-
-    logger.warning("Could not find info table XML for %s", filing["accession"])
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -207,15 +206,15 @@ def _parse_info_table(xml_content: bytes) -> list[dict]:
             shares = 0
 
         try:
-            value_thousands = int(value_str.replace(",", "")) if value_str else 0
+            value = int(value_str.replace(",", "")) if value_str else 0
         except ValueError:
-            value_thousands = 0
+            value = 0
 
         holdings.append({
             "cusip": cusip,
             "name_of_issuer": _find("nameOfIssuer"),
             "shares": shares,
-            "value_thousands": value_thousands,
+            "value": value,
             "investment_discretion": _find("investmentDiscretion"),
             "share_type": _find_nested("shrsOrPrnAmt", "sshPrnamtType"),
         })
@@ -236,7 +235,7 @@ def extract_holdings(
     """Extract all insurance stock holdings from an institution's 13F filings.
 
     Returns DataFrame with columns:
-        institution, ticker, filing_date, quarter, shares, value_thousands,
+        institution, ticker, filing_date, quarter, shares, value,
         investment_discretion
     """
     cache_name = f"holdings_{institution_key}"
@@ -294,7 +293,7 @@ def extract_holdings(
                 "quarter": report_quarter,
                 "filing_date": filing_date,
                 "shares": h["shares"],
-                "value_thousands": h["value_thousands"],
+                "value": h["value"],
                 "investment_discretion": h["investment_discretion"],
             })
 
@@ -303,6 +302,20 @@ def extract_holdings(
         return pd.DataFrame()
 
     df = pd.DataFrame(all_records)
+
+    # Aggregate sub-manager positions: some institutions (e.g. Fidelity)
+    # report separate lines per sub-manager. Sum shares and value per
+    # institution × ticker × quarter.
+    df = (
+        df.groupby(["institution", "institution_name", "style", "ticker", "quarter", "filing_date"], as_index=False)
+        .agg({"shares": "sum", "value": "sum"})
+    )
+
+    # If multiple filings exist for the same quarter (original + amendment),
+    # keep only the latest filing date per institution × ticker × quarter.
+    df = df.sort_values("filing_date")
+    df = df.drop_duplicates(subset=["institution", "ticker", "quarter"], keep="last")
+
     df = df.sort_values(["ticker", "quarter"]).reset_index(drop=True)
 
     cache.save(df, data_dir, NAMESPACE, cache_name)
@@ -328,8 +341,8 @@ def compute_deltas(holdings: pd.DataFrame) -> pd.DataFrame:
     df["delta_pct"] = (df["shares"] - prev_shares) / prev_shares.replace(0, float("nan")) * 100
 
     # Compute portfolio weight (value of position / total portfolio value per quarter)
-    quarter_totals = df.groupby(["institution", "quarter"])["value_thousands"].transform("sum")
-    df["portfolio_weight"] = df["value_thousands"] / quarter_totals.replace(0, float("nan")) * 100
+    quarter_totals = df.groupby(["institution", "quarter"])["value"].transform("sum")
+    df["portfolio_weight"] = df["value"] / quarter_totals.replace(0, float("nan")) * 100
 
     return df
 

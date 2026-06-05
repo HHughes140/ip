@@ -13,7 +13,7 @@ class TestComputeDeltas:
             "ticker": ["PGR", "PGR", "TRV", "TRV"],
             "quarter": ["2024-Q1", "2024-Q2", "2024-Q1", "2024-Q2"],
             "shares": [100000, 120000, 50000, 45000],
-            "value_thousands": [10000, 13000, 8000, 7500],
+            "value": [10000, 13000, 8000, 7500],
             "style": ["active", "active", "active", "active"],
         })
         result = compute_deltas(holdings)
@@ -30,7 +30,7 @@ class TestComputeDeltas:
             "ticker": ["PGR", "PGR"],
             "quarter": ["2024-Q1", "2024-Q2"],
             "shares": [100000, 120000],
-            "value_thousands": [10000, 13000],
+            "value": [10000, 13000],
             "style": ["active", "active"],
         })
         result = compute_deltas(holdings)
@@ -43,7 +43,7 @@ class TestComputeDeltas:
             "ticker": ["PGR", "TRV"],
             "quarter": ["2024-Q1", "2024-Q1"],
             "shares": [100000, 50000],
-            "value_thousands": [10000, 5000],
+            "value": [10000, 5000],
             "style": ["active", "active"],
         })
         result = compute_deltas(holdings)
@@ -76,7 +76,7 @@ class TestParseInfoTable:
         assert len(holdings) == 1
         assert holdings[0]["cusip"] == "743315103"
         assert holdings[0]["shares"] == 1000000
-        assert holdings[0]["value_thousands"] == 150000
+        assert holdings[0]["value"] == 150000
 
     def test_empty_xml(self):
         xml = b"""<?xml version="1.0"?><root></root>"""

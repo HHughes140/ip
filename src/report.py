@@ -13,6 +13,7 @@ from rich.panel import Panel
 
 from src.model.pressure_score import PressureResult
 from src.model.accumulation import AccumulationSignal
+from src.model.factor_analysis import FactorTradeResult, InstitutionFactorProfile
 
 logger = logging.getLogger(__name__)
 
@@ -263,3 +264,124 @@ def generate_markdown_report(results: list[PressureResult], output_path: str) ->
     path.write_text("\n".join(lines))
     logger.info("Markdown report written to %s", path)
     return path
+
+
+def print_factor_report(
+    overall_results: list[FactorTradeResult],
+    profiles: dict[str, InstitutionFactorProfile],
+    predictions: "pd.DataFrame",
+) -> None:
+    """Print factor-trade analysis results."""
+    import pandas as pd
+    console = Console()
+
+    console.print()
+    console.print(Panel(
+        "[bold]Factor-Trade Analysis[/bold]\n"
+        "Which factors drive institutional trading in insurance stocks?",
+        style="cyan",
+    ))
+
+    # --- Overall factor significance ---
+    if overall_results:
+        table = Table(title="Factor Significance (All Institutions)", show_header=True, header_style="bold")
+        table.add_column("Factor", width=25)
+        table.add_column("Corr", justify="right", width=8)
+        table.add_column("p-value", justify="right", width=10)
+        table.add_column("Sig", justify="center", width=5)
+        table.add_column("Direction", width=16)
+        table.add_column("Q1 Buy%", justify="right", width=8)
+        table.add_column("Q4 Buy%", justify="right", width=8)
+        table.add_column("N", justify="right", width=6)
+
+        for r in overall_results:
+            corr_style = "green" if r.correlation > 0 else ("red" if r.correlation < 0 else "")
+            sig_style = "bold green" if r.is_significant else "dim"
+            q1 = r.quartile_buy_rates.get("Q1", 0)
+            q4 = r.quartile_buy_rates.get("Q4", 0)
+
+            dir_text = r.direction.replace("_", " ")
+            if r.direction == "buy_when_high":
+                dir_text = "buy when high"
+                dir_style = "green"
+            elif r.direction == "buy_when_low":
+                dir_text = "buy when low"
+                dir_style = "red"
+            else:
+                dir_style = "dim"
+
+            table.add_row(
+                r.factor_name.replace("_", " ").title(),
+                Text(f"{r.correlation:+.3f}", style=corr_style),
+                f"{r.p_value:.4f}",
+                Text(r.stars or "-", style=sig_style),
+                Text(dir_text, style=dir_style),
+                f"{q1:.0%}",
+                f"{q4:.0%}",
+                str(r.n_observations),
+            )
+
+        console.print(table)
+    else:
+        console.print("[dim]No significant factor-trade relationships found.[/dim]")
+
+    # --- Per-institution profiles ---
+    if profiles:
+        console.print()
+        console.print("[bold cyan]Institution Factor Profiles[/bold cyan]")
+        console.print()
+
+        for inst_key, profile in sorted(profiles.items(), key=lambda x: -x[1].model_auc):
+            auc_style = "green" if profile.model_auc > 0.6 else ("yellow" if profile.model_auc > 0.55 else "dim")
+            console.print(
+                f"  [bold]{profile.institution_name}[/bold] ({profile.style})  "
+                f"AUC=[{auc_style}]{profile.model_auc:.3f}[/{auc_style}]  "
+                f"n={profile.n_trades}"
+            )
+
+            # Top 5 factors by importance
+            top_factors = list(profile.feature_importances.items())[:5]
+            if top_factors:
+                parts = []
+                for fname, coef in top_factors:
+                    color = "green" if coef > 0 else "red"
+                    parts.append(f"[{color}]{fname}: {coef:+.3f}[/{color}]")
+                console.print(f"    Factors: {', '.join(parts)}")
+
+            # Significant univariate factors
+            sig = [f for f in profile.significant_factors if f.is_significant]
+            if sig:
+                sig_names = [f"{f.factor_name}{f.stars}" for f in sig[:5]]
+                console.print(f"    Significant: {', '.join(sig_names)}")
+
+            console.print()
+
+    # --- Current predictions ---
+    if predictions is not None and not predictions.empty:
+        console.print()
+        pred_table = Table(title="Current Factor Regime Predictions", show_header=True, header_style="bold")
+        pred_table.add_column("Ticker", width=6)
+        pred_table.add_column("Institution", width=25)
+        pred_table.add_column("P(Buy)", justify="right", width=8)
+        pred_table.add_column("Prediction", width=15)
+        pred_table.add_column("AUC", justify="right", width=6)
+
+        for _, row in predictions.iterrows():
+            if row["predicted_action"] == "LIKELY BUYING":
+                action_style = "bold green"
+            elif row["predicted_action"] == "LIKELY SELLING":
+                action_style = "bold red"
+            else:
+                action_style = "dim"
+
+            pred_table.add_row(
+                row["ticker"],
+                row["institution_name"],
+                f"{row['p_buy']:.0%}",
+                Text(row["predicted_action"], style=action_style),
+                f"{row['model_auc']:.2f}",
+            )
+
+        console.print(pred_table)
+
+    console.print()

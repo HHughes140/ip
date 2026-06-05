@@ -30,11 +30,11 @@ INSURANCE_UNIVERSE: dict[str, Stock] = {
     "HIG":  Stock("HIG",  "Hartford Financial",        "416515104", "commercial"),
     "CNA":  Stock("CNA",  "CNA Financial",             "126117100", "commercial"),
     "MKL":  Stock("MKL",  "Markel Group",              "570535104", "specialty"),
-    "RNR":  Stock("RNR",  "RenaissanceRe",             "75968L105", "reinsurance"),
+    "RNR":  Stock("RNR",  "RenaissanceRe",             "G7496G103", "reinsurance"),
     "ACGL": Stock("ACGL", "Arch Capital",              "G0450A105", "reinsurance"),
     "AFG":  Stock("AFG",  "American Financial Group",  "025932104", "specialty"),
     "WRB":  Stock("WRB",  "Berkley (W.R.)",            "084423102", "commercial"),
-    "RE":   Stock("RE",   "Everest Group",             "29977A105", "reinsurance"),
+    "RE":   Stock("RE",   "Everest Group",             "G3223R108", "reinsurance"),
     "ERIE": Stock("ERIE", "Erie Indemnity",            "29530P102", "personal"),
     "KNSL": Stock("KNSL", "Kinsale Capital",           "49714P108", "specialty"),
     "CINF": Stock("CINF", "Cincinnati Financial",      "172062101", "multi-line"),
@@ -43,7 +43,7 @@ INSURANCE_UNIVERSE: dict[str, Stock] = {
     "SIGI": Stock("SIGI", "Selective Insurance",       "816300107", "commercial"),
     "RLI":  Stock("RLI",  "RLI Corp",                  "749607107", "specialty"),
     "PLMR": Stock("PLMR", "Palomar Holdings",         "69753M105", "specialty"),
-    "EG":   Stock("EG",   "Everest Group",             "29977A105", "reinsurance"),
+    "RYAN": Stock("RYAN", "Ryan Specialty Holdings",   "78351F107", "specialty"),
 }
 
 # Quick lookup sets
