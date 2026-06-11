@@ -25,13 +25,13 @@ logger = logging.getLogger(__name__)
 VOLUME_FEATURES = [
     "residual_z",
     "residual_combined",
-    "momentum_3m",
-    "momentum_6m",
-    "volatility_60d",
+    "momentum",
+    "short_momentum",
+    "volatility",
     "volume_zscore",
     "cum_anomaly_5d",
     "pc_volume_ratio",
-    "earnings_revision",
+    "crowding_delta_1m",
 ]
 
 
@@ -48,18 +48,29 @@ def build_volume_features(
     factors: pd.DataFrame,
     volume_signals: pd.DataFrame,
     options_signals: pd.DataFrame,
+    crowding_signals: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Merge all signal sources into a feature matrix for volume prediction."""
     df = residuals[["ticker", "residual_z", "residual_combined"]].copy()
 
-    # Merge factor data
-    factor_cols = ["ticker", "momentum_3m", "momentum_6m", "volatility_60d", "earnings_revision"]
+    # Merge Axioma factor data
+    factor_cols = ["ticker", "momentum", "short_momentum", "volatility"]
     available_factor_cols = [c for c in factor_cols if c in factors.columns]
     if available_factor_cols:
         df = df.merge(
             factors[available_factor_cols],
             on="ticker", how="left",
         )
+
+    # Merge crowding signals
+    if crowding_signals is not None and not crowding_signals.empty:
+        crowd_cols = ["ticker", "crowding_delta_1m"]
+        available_crowd_cols = [c for c in crowd_cols if c in crowding_signals.columns]
+        if len(available_crowd_cols) > 1:
+            df = df.merge(
+                crowding_signals[available_crowd_cols],
+                on="ticker", how="left",
+            )
 
     # Merge volume signals
     vol_cols = ["ticker", "volume_zscore", "cum_anomaly_5d"]
@@ -130,12 +141,19 @@ def predict_volume_spikes(
             components.append(opt_score)
             weights.append(0.15)
 
-        # Momentum — stocks with momentum shifts
-        mom = row.get("momentum_3m", 0)
+        # Momentum — Axioma exposure (standardized, typically [-3, 3])
+        mom = row.get("momentum", 0)
         if pd.notna(mom):
-            mom_score = min(abs(mom) / 20, 1.0)
+            mom_score = min(abs(mom) / 2, 1.0)
             components.append(mom_score)
-            weights.append(0.15)
+            weights.append(0.10)
+
+        # Crowding shift — institutions entering/exiting now
+        crowd_delta = row.get("crowding_delta_1m")
+        if crowd_delta is not None and pd.notna(crowd_delta):
+            crowd_score = min(abs(crowd_delta) / 1.0, 1.0)
+            components.append(crowd_score)
+            weights.append(0.05)
 
         # Weighted average
         if components:

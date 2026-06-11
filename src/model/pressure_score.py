@@ -1,9 +1,9 @@
 """Composite Institutional Pressure Score (IPS).
 
 Combines all signal components into a single score per stock:
-    IPS = w1·residual_z + w2·volume_anomaly + w3·ownership_concentration_Δ
-        + w4·etf_flow_impact + w5·options_signal + w6·earnings_revision
-        + w7·volume_prediction
+    IPS = w1·residual_z + w2·crowding + w3·volume_anomaly
+        + w4·ownership_concentration_Δ + w5·etf_flow_impact
+        + w6·options_signal + w7·earnings_revision + w8·volume_prediction
 
 Score range: [-100, +100]
     +100 = strong accumulation signal
@@ -55,12 +55,13 @@ class PressureResult:
 
 # Default component weights — can be calibrated on forward 13F changes
 DEFAULT_WEIGHTS = {
-    "residual": 0.30,
-    "volume_anomaly": 0.15,
+    "residual": 0.25,
+    "crowding": 0.15,
+    "volume_anomaly": 0.125,
+    "options_signal": 0.125,
     "ownership_concentration": 0.10,
-    "etf_flow": 0.10,
-    "options_signal": 0.15,
-    "earnings_revision": 0.10,
+    "etf_flow": 0.075,
+    "earnings_revision": 0.075,
     "volume_prediction": 0.10,
 }
 
@@ -79,6 +80,7 @@ def compute_pressure_scores(
     ownership_changes: pd.DataFrame,
     volume_predictions: list[VolumePrediction],
     holdings: pd.DataFrame | None = None,
+    crowding_signals: pd.DataFrame | None = None,
     weights: dict[str, float] | None = None,
 ) -> list[PressureResult]:
     """Compute the Institutional Pressure Score for each stock.
@@ -104,6 +106,27 @@ def compute_pressure_scores(
         # 1. Residual demand (strongest signal)
         res_z = row.get("residual_z", 0)
         components["residual"] = _sigmoid_scale(res_z, scale=2.0)
+
+        # 1b. Crowding — leading indicator of institutional entry.
+        # Rising crowding (delta) = institutions entering now = accumulation
+        # pressure. The level (crowding_z) dampens the signal when a name is
+        # already saturated — extremely crowded names have less room to add.
+        crowd_row = (
+            crowding_signals[crowding_signals["ticker"] == ticker]
+            if crowding_signals is not None and not crowding_signals.empty
+            else pd.DataFrame()
+        )
+        if not crowd_row.empty:
+            delta_1m = crowd_row.iloc[0].get("crowding_delta_1m")
+            crowd_z = crowd_row.iloc[0].get("crowding_z", 0)
+            if pd.notna(delta_1m):
+                crowd_z = crowd_z if pd.notna(crowd_z) else 0
+                damping = 1 - 0.5 * np.clip(crowd_z, 0, 2) / 2
+                components["crowding"] = _sigmoid_scale(delta_1m * damping, scale=1.0)
+            else:
+                components["crowding"] = 0.0
+        else:
+            components["crowding"] = 0.0
 
         # 2. Volume anomaly
         vol_row = volume_signals[volume_signals["ticker"] == ticker]

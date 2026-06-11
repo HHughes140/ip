@@ -266,6 +266,225 @@ def generate_markdown_report(results: list[PressureResult], output_path: str) ->
     return path
 
 
+def print_convergence_report(
+    panel: "pd.DataFrame",
+    readability: "pd.DataFrame",
+    factor_impacts: list,
+    player_impacts: list,
+    latest_only: bool = True,
+) -> None:
+    """Print trade convergence analysis: who's trading, how readable they
+    are, and the market impact of each factor and player."""
+    import pandas as pd
+    console = Console()
+
+    console.print()
+    console.print(Panel(
+        "[bold]Trade Convergence Analysis[/bold]\n"
+        "13F direction × unusual volume × known factors × similar quarters",
+        style="cyan",
+    ))
+
+    # --- 1. Convergence table (latest quarter trades) ---
+    if not panel.empty and "convergence_score" in panel.columns:
+        display = panel.dropna(subset=["convergence_score"])
+        if latest_only and not display.empty:
+            latest_q = display["quarter"].max()
+            display = display[display["quarter"] == latest_q]
+            title = f"Trade Convergence — {latest_q}"
+        else:
+            title = "Trade Convergence"
+
+        display = display.sort_values("convergence_score", ascending=False)
+
+        table = Table(title=title, show_header=True, header_style="bold")
+        table.add_column("Ticker", width=6)
+        table.add_column("Institution", width=20)
+        table.add_column("Dir", justify="center", width=5)
+        table.add_column("Factor Align", justify="right", width=12)
+        table.add_column("Vol Confirms", justify="center", width=12)
+        table.add_column("Hist Consist", justify="right", width=12)
+        table.add_column("Converge", justify="right", width=9)
+        table.add_column("Verdict", width=20)
+
+        for _, row in display.head(30).iterrows():
+            dir_text = Text("BUY", style="green") if row["direction"] > 0 else Text("SELL", style="red")
+            verdict = row["verdict"]
+            if verdict.startswith("CONVERGED"):
+                v_style = "bold green" if "BUYING" in verdict else "bold red"
+            elif verdict == "PARTIAL":
+                v_style = "yellow"
+            else:
+                v_style = "dim"
+
+            align = row.get("factor_alignment_score")
+            consist = row.get("historical_consistency")
+            table.add_row(
+                row["ticker"],
+                str(row.get("institution_name", row["institution"])),
+                dir_text,
+                f"{align:+.2f}" if pd.notna(align) else "—",
+                "yes" if row.get("volume_confirms") else "no",
+                f"{consist:.0%}" if pd.notna(consist) else "—",
+                f"{row['convergence_score']:.2f}",
+                Text(verdict, style=v_style),
+            )
+
+        console.print(table)
+
+    # --- 2. Factor market impact ---
+    if factor_impacts:
+        console.print()
+        table = Table(
+            title="Market Impact per Factor (quarterly return per +1σ exposure)",
+            show_header=True, header_style="bold",
+        )
+        table.add_column("Factor", width=20)
+        table.add_column("Avg Impact (bps)", justify="right", width=16)
+        table.add_column("t-stat", justify="right", width=8)
+        table.add_column("Hit Rate", justify="right", width=9)
+        table.add_column("Last Qtr (bps)", justify="right", width=14)
+        table.add_column("N Qtrs", justify="right", width=7)
+
+        for fi in factor_impacts:
+            style = "green" if fi.avg_impact_bps > 0 else "red"
+            sig = "bold " + style if abs(fi.t_stat) >= 2 else style
+            table.add_row(
+                fi.factor.replace("_", " ").title(),
+                Text(f"{fi.avg_impact_bps:+.1f}", style=sig),
+                f"{fi.t_stat:+.2f}",
+                f"{fi.hit_rate:.0%}",
+                f"{fi.last_quarter_impact_bps:+.1f}",
+                str(fi.n_quarters),
+            )
+
+        console.print(table)
+
+    # --- 3. Player market impact + readability ---
+    if player_impacts:
+        console.print()
+        read_map = {}
+        if readability is not None and not readability.empty:
+            read_map = readability.set_index("institution")["avg_convergence"].to_dict()
+
+        table = Table(
+            title="Market Impact per Player",
+            show_header=True, header_style="bold",
+        )
+        table.add_column("Institution", width=20)
+        table.add_column("Style", width=8)
+        table.add_column("Participation", justify="right", width=13)
+        table.add_column("Buy Impact (bps)", justify="right", width=16)
+        table.add_column("Sell Impact (bps)", justify="right", width=17)
+        table.add_column("Vol Footprint", justify="right", width=13)
+        table.add_column("Readability", justify="right", width=11)
+        table.add_column("Trades", justify="right", width=7)
+
+        for pi in player_impacts:
+            readab = read_map.get(pi.institution)
+            table.add_row(
+                pi.institution_name,
+                pi.style,
+                f"{pi.avg_participation_pct:.2f}%",
+                Text(f"{pi.impact_bps_when_buying:+.0f}",
+                     style="green" if pi.impact_bps_when_buying > 0 else "red"),
+                Text(f"{pi.impact_bps_when_selling:+.0f}",
+                     style="red" if pi.impact_bps_when_selling < 0 else "green"),
+                f"{pi.volume_footprint:.2f}",
+                f"{readab:.2f}" if readab is not None else "—",
+                str(pi.n_trades),
+            )
+
+        console.print(table)
+
+    console.print()
+
+
+def generate_convergence_markdown(
+    panel: "pd.DataFrame",
+    readability: "pd.DataFrame",
+    factor_impacts: list,
+    player_impacts: list,
+    output_path: str,
+) -> Path:
+    """Write the convergence analysis to markdown."""
+    import pandas as pd
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "# Trade Convergence Report",
+        "",
+        f"**Generated:** {datetime.now():%Y-%m-%d %H:%M}",
+        "",
+    ]
+
+    if not panel.empty and "convergence_score" in panel.columns:
+        display = panel.dropna(subset=["convergence_score"])
+        if not display.empty:
+            latest_q = display["quarter"].max()
+            display = display[display["quarter"] == latest_q].sort_values(
+                "convergence_score", ascending=False
+            )
+            lines += [
+                f"## Trade Convergence — {latest_q}",
+                "",
+                "| Ticker | Institution | Dir | Factor Align | Vol | Hist | Score | Verdict |",
+                "|--------|-------------|-----|--------------|-----|------|-------|---------|",
+            ]
+            for _, row in display.iterrows():
+                align = row.get("factor_alignment_score")
+                consist = row.get("historical_consistency")
+                lines.append(
+                    f"| {row['ticker']} | {row.get('institution_name', row['institution'])} | "
+                    f"{'BUY' if row['direction'] > 0 else 'SELL'} | "
+                    f"{f'{align:+.2f}' if pd.notna(align) else '—'} | "
+                    f"{'yes' if row.get('volume_confirms') else 'no'} | "
+                    f"{f'{consist:.0%}' if pd.notna(consist) else '—'} | "
+                    f"{row['convergence_score']:.2f} | {row['verdict']} |"
+                )
+            lines.append("")
+
+    if factor_impacts:
+        lines += [
+            "## Market Impact per Factor",
+            "",
+            "| Factor | Avg Impact (bps/1σ) | t-stat | Hit Rate | Last Qtr (bps) | N |",
+            "|--------|---------------------|--------|----------|----------------|---|",
+        ]
+        for fi in factor_impacts:
+            lines.append(
+                f"| {fi.factor.replace('_', ' ').title()} | {fi.avg_impact_bps:+.1f} | "
+                f"{fi.t_stat:+.2f} | {fi.hit_rate:.0%} | "
+                f"{fi.last_quarter_impact_bps:+.1f} | {fi.n_quarters} |"
+            )
+        lines.append("")
+
+    if player_impacts:
+        read_map = {}
+        if readability is not None and not readability.empty:
+            read_map = readability.set_index("institution")["avg_convergence"].to_dict()
+        lines += [
+            "## Market Impact per Player",
+            "",
+            "| Institution | Style | Participation | Buy Impact | Sell Impact | Vol Footprint | Readability | Trades |",
+            "|-------------|-------|---------------|------------|-------------|---------------|-------------|--------|",
+        ]
+        for pi in player_impacts:
+            readab = read_map.get(pi.institution)
+            lines.append(
+                f"| {pi.institution_name} | {pi.style} | {pi.avg_participation_pct:.2f}% | "
+                f"{pi.impact_bps_when_buying:+.0f} bps | {pi.impact_bps_when_selling:+.0f} bps | "
+                f"{pi.volume_footprint:.2f} | "
+                f"{f'{readab:.2f}' if readab is not None else '—'} | {pi.n_trades} |"
+            )
+        lines.append("")
+
+    path.write_text("\n".join(lines))
+    logger.info("Convergence report written to %s", path)
+    return path
+
+
 def print_factor_report(
     overall_results: list[FactorTradeResult],
     profiles: dict[str, InstitutionFactorProfile],

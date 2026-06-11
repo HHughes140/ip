@@ -4,7 +4,9 @@ import pandas as pd
 import numpy as np
 import pytest
 
-from src.model.pressure_score import compute_pressure_scores, _sigmoid_scale, PressureResult
+from src.model.pressure_score import (
+    compute_pressure_scores, _sigmoid_scale, PressureResult, DEFAULT_WEIGHTS,
+)
 from src.model.volume_model import VolumePrediction
 from src.universe import INSURANCE_UNIVERSE
 
@@ -96,6 +98,51 @@ class TestPressureScore:
             assert "residual" in r.components
             assert "volume_anomaly" in r.components
             assert "options_signal" in r.components
+            assert "crowding" in r.components
+
+    def test_crowding_neutral_when_missing(self):
+        args = self._make_inputs()
+        results = compute_pressure_scores(*args)
+        for r in results:
+            assert r.components["crowding"] == 0.0
+
+    def test_crowding_rising_is_positive(self):
+        args = self._make_inputs()
+        crowding = pd.DataFrame({
+            "ticker": ["PGR", "TRV"],
+            "crowding_composite": [0.5, -0.3],
+            "crowding_delta_1m": [0.8, -0.6],
+            "crowding_z": [0.5, -0.4],
+        })
+        results = compute_pressure_scores(*args, crowding_signals=crowding)
+        pgr = [r for r in results if r.ticker == "PGR"][0]
+        trv = [r for r in results if r.ticker == "TRV"][0]
+        assert pgr.components["crowding"] > 0
+        assert trv.components["crowding"] < 0
+
+    def test_crowding_saturation_dampens(self):
+        # Same delta, but one name is already extremely crowded — the
+        # saturated name should get a smaller positive signal.
+        args = self._make_inputs()
+        crowding = pd.DataFrame({
+            "ticker": ["PGR", "TRV"],
+            "crowding_composite": [3.0, 0.0],
+            "crowding_delta_1m": [0.8, 0.8],
+            "crowding_z": [2.0, 0.0],
+        })
+        results = compute_pressure_scores(*args, crowding_signals=crowding)
+        pgr = [r for r in results if r.ticker == "PGR"][0]
+        trv = [r for r in results if r.ticker == "TRV"][0]
+        assert 0 < pgr.components["crowding"] < trv.components["crowding"]
+
+
+class TestDefaultWeights:
+    def test_weights_sum_to_one(self):
+        assert sum(DEFAULT_WEIGHTS.values()) == pytest.approx(1.0)
+
+    def test_has_eight_components(self):
+        assert len(DEFAULT_WEIGHTS) == 8
+        assert "crowding" in DEFAULT_WEIGHTS
 
 
 class TestPressureResultStrength:

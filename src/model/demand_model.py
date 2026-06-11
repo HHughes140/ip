@@ -26,10 +26,14 @@ from sklearn.metrics import roc_auc_score
 logger = logging.getLogger(__name__)
 
 FACTOR_FEATURES = [
-    "market_cap", "pe_trailing", "pe_forward", "pb", "ev_ebitda",
-    "roe", "dividend_yield", "momentum_3m", "momentum_6m", "momentum_12m",
-    "beta_1y", "volatility_60d", "earnings_revision",
+    # Axioma risk model exposures
+    "value", "growth", "momentum", "short_momentum", "volatility",
+    "size", "leverage", "profitability", "earnings_yield",
+    "dividend_yield", "liquidity", "market_sensitivity", "fx_sensitivity",
+    # Macro rate environment (FRED)
     "treasury_10y", "credit_spread", "spread_2s10s",
+    # Crowding — leading indicator of institutional entry
+    "crowding_composite", "crowding_delta_1m",
 ]
 
 
@@ -46,6 +50,7 @@ def build_training_data(
     holdings: pd.DataFrame,
     factors: pd.DataFrame,
     rates: pd.DataFrame | None = None,
+    crowding: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Merge holdings deltas with factor snapshots to create training panel.
 
@@ -68,6 +73,16 @@ def build_training_data(
             if col in factors.columns:
                 ticker_factor = factors.set_index("ticker")[col]
                 df[col] = df["ticker"].map(ticker_factor)
+
+    # Merge crowding history (quarter-end composite + 1m delta)
+    if crowding is not None and not crowding.empty and "quarter" in crowding.columns:
+        crowd_cols = [c for c in ["crowding_composite", "crowding_delta_1m"]
+                      if c in crowding.columns]
+        if crowd_cols:
+            df = df.merge(
+                crowding[["ticker", "quarter"] + crowd_cols],
+                on=["ticker", "quarter"], how="left", suffixes=("", "_crowd"),
+            )
 
     # Merge rate environment if available
     if rates is not None and not rates.empty:
@@ -218,9 +233,10 @@ def fit_and_save(
     factors: pd.DataFrame,
     model_dir: str,
     rates: pd.DataFrame | None = None,
+    crowding: pd.DataFrame | None = None,
 ) -> dict[str, DemandModelResult]:
     """Fit demand models for both passive and active styles, persist."""
-    training_data = build_training_data(holdings, factors, rates)
+    training_data = build_training_data(holdings, factors, rates, crowding)
 
     if training_data.empty:
         logger.warning("No training data available")

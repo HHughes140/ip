@@ -2,7 +2,7 @@
 
 Usage:
     pressure run              # Full pipeline
-    pressure ingest           # Pull 13F, factors, volume, options, ETF, rates
+    pressure ingest           # Pull 13F, Axioma factors, volume, crowding, options, ETF, rates
     pressure model            # Fit demand model
     pressure score            # Compute pressure scores
     pressure report           # Generate report
@@ -20,10 +20,11 @@ import pandas as pd
 import yaml
 
 from src.universe import INSTITUTION_REGISTRY, ALL_TICKERS, INSURANCE_UNIVERSE
-from src.data import edgar_13f, factors, volume, options, etf_flows, fred_rates, cache
+from src.data import edgar_13f, options, etf_flows, fred_rates, cache
+from src.data import snowflake_price_volume, snowflake_factors, snowflake_crowding
 from src.data import factor_loader
 from src.model import demand_model, residual, volume_model, pressure_score, accumulation
-from src.model import factor_analysis
+from src.model import factor_analysis, convergence
 from src import report
 
 logger = logging.getLogger(__name__)
@@ -61,30 +62,42 @@ def cli(ctx, config, verbose):
     ctx.obj["config"] = _load_config(config)
     ctx.obj["data_dir"] = ctx.obj["config"].get("data_dir", "data")
     ctx.obj["model_dir"] = ctx.obj["config"].get("model_dir", "data/models")
+    ctx.obj["snowflake"] = ctx.obj["config"].get("snowflake", {})
 
 
 @cli.command()
 @click.option("--force", is_flag=True, help="Ignore cache, re-download everything")
 @click.pass_context
 def ingest(ctx, force):
-    """Pull data from all sources (13F, factors, volume, options, ETF, rates)."""
+    """Pull data from all sources (13F, factors, volume, crowding, options, ETF, rates)."""
     config = ctx.obj["config"]
     data_dir = ctx.obj["data_dir"]
+    snowflake_cfg = ctx.obj["snowflake"]
+    start_year = config.get("history", {}).get("start_year", 2015)
 
     # 13F holdings
     click.echo("Ingesting 13F holdings...")
     holdings = edgar_13f.refresh_all(data_dir, force=force)
     click.echo(f"  13F: {len(holdings)} holdings records")
 
-    # Factor data
-    click.echo("Pulling factor data...")
-    fac = factors.refresh_all(data_dir, force=force)
+    # Axioma factors (Snowflake)
+    click.echo("Pulling Axioma factors from Snowflake...")
+    fac = snowflake_factors.refresh_all(
+        data_dir, snowflake_cfg, start_year=start_year, force=force
+    )
     click.echo(f"  Factors: {len(fac)} stocks")
 
-    # Volume signals
-    click.echo("Computing volume signals...")
-    vol = volume.refresh_all(data_dir, force=force)
+    # Volume signals (Snowflake)
+    click.echo("Computing volume signals from Snowflake...")
+    vol = snowflake_price_volume.refresh_all(data_dir, snowflake_cfg, force=force)
     click.echo(f"  Volume: {len(vol)} stocks")
+
+    # Crowding scores (Snowflake — MS/JPM/UBS/Citi/NR)
+    click.echo("Pulling crowding scores from Snowflake...")
+    crowd = snowflake_crowding.refresh_all(
+        data_dir, snowflake_cfg, start_year=start_year, force=force
+    )
+    click.echo(f"  Crowding: {len(crowd)} stocks")
 
     # Options activity
     click.echo("Pulling options data...")
@@ -116,15 +129,20 @@ def model(ctx):
     model_dir = ctx.obj["model_dir"]
 
     holdings = edgar_13f.load_holdings(data_dir)
-    fac = factors.load_snapshot(data_dir)
+    # Use quarterly Axioma history for walk-forward training; fall back to
+    # the current snapshot if history is unavailable.
+    fac = snowflake_factors.load_history(data_dir)
+    if fac is None or fac.empty:
+        fac = snowflake_factors.load_snapshot(data_dir)
     rates_df = fred_rates.load_panel(data_dir)
+    crowding_df = snowflake_crowding.load_history(data_dir)
 
     if holdings is None or fac is None:
         click.echo("Error: Run 'pressure ingest' first.", err=True)
         sys.exit(1)
 
     click.echo("Fitting demand models...")
-    results = demand_model.fit_and_save(holdings, fac, model_dir, rates_df)
+    results = demand_model.fit_and_save(holdings, fac, model_dir, rates_df, crowding_df)
 
     for style, res in results.items():
         click.echo(
@@ -146,6 +164,7 @@ def learn_fingerprints(ctx):
     """
     data_dir = ctx.obj["data_dir"]
     model_dir = ctx.obj["model_dir"]
+    snowflake_cfg = ctx.obj["snowflake"]
 
     holdings = edgar_13f.load_holdings(data_dir)
     if holdings is None or holdings.empty:
@@ -153,7 +172,7 @@ def learn_fingerprints(ctx):
         sys.exit(1)
 
     click.echo("Building historical volume profiles (this may take a while)...")
-    profiles = accumulation.build_profiles_from_cache(holdings, data_dir)
+    profiles = accumulation.build_profiles_from_cache(holdings, data_dir, snowflake_cfg)
 
     if profiles.empty:
         click.echo("No profiles could be built. Check that holdings data has position changes.")
@@ -184,13 +203,20 @@ def learn_fingerprints(ctx):
 def score(ctx):
     """Compute current Institutional Pressure Scores."""
     data_dir = ctx.obj["data_dir"]
+    snowflake_cfg = ctx.obj["snowflake"]
 
     # Load all data
     holdings = edgar_13f.load_holdings(data_dir)
-    fac = factors.load_snapshot(data_dir) or pd.DataFrame()
-    vol = volume.load_latest(data_dir) or pd.DataFrame()
-    opts = options.load_latest(data_dir) or pd.DataFrame()
-    etf = etf_flows.load_latest(data_dir) or pd.DataFrame()
+    fac = snowflake_factors.load_snapshot(data_dir)
+    fac = fac if fac is not None else pd.DataFrame()
+    vol = snowflake_price_volume.load_latest(data_dir)
+    vol = vol if vol is not None else pd.DataFrame()
+    crowd = snowflake_crowding.load_signals(data_dir)
+    crowd = crowd if crowd is not None else pd.DataFrame()
+    opts = options.load_latest(data_dir)
+    opts = opts if opts is not None else pd.DataFrame()
+    etf = etf_flows.load_latest(data_dir)
+    etf = etf if etf is not None else pd.DataFrame()
 
     if holdings is None or holdings.empty:
         click.echo("Error: No holdings data. Run 'pressure ingest' first.", err=True)
@@ -251,17 +277,16 @@ def score(ctx):
     current_daily: dict[str, pd.DataFrame] = {}
     if fingerprints:
         click.echo("  Using learned execution fingerprints")
-        import yfinance as yf
-        tickers_in_holdings = holdings["ticker"].unique()
-        for ticker in tickers_in_holdings:
-            try:
-                t = yf.Ticker(ticker)
-                hist = t.history(period="3mo", auto_adjust=True)
-                if not hist.empty:
-                    hist.index = hist.index.tz_localize(None)
-                    current_daily[ticker] = hist[["Volume", "Close"]]
-            except Exception:
-                pass
+        import datetime as dt
+        tickers_in_holdings = list(holdings["ticker"].unique())
+        end = dt.date.today() + dt.timedelta(days=1)
+        start = end - dt.timedelta(days=95)  # ~3 months
+        try:
+            current_daily = snowflake_price_volume.get_all_histories(
+                tickers_in_holdings, start.isoformat(), end.isoformat(), snowflake_cfg
+            )
+        except Exception as e:
+            click.echo(f"  Warning: Snowflake daily fetch failed: {e}")
     else:
         click.echo("  No fingerprints found — using volume heuristics (run 'pressure learn' to train)")
 
@@ -274,7 +299,7 @@ def score(ctx):
 
     # Volume predictions
     click.echo("Predicting volume spikes...")
-    vol_features = volume_model.build_volume_features(agg_resid, fac, vol, opts)
+    vol_features = volume_model.build_volume_features(agg_resid, fac, vol, opts, crowd)
     vol_preds = volume_model.predict_volume_spikes(vol_features)
 
     # Composite pressure score
@@ -288,6 +313,7 @@ def score(ctx):
         ownership_changes=ownership,
         volume_predictions=vol_preds,
         holdings=holdings,
+        crowding_signals=crowd,
     )
 
     # Output
@@ -325,10 +351,16 @@ def detail(ctx, ticker):
 
     # Recompute scores (or load cached — for now recompute)
     holdings = edgar_13f.load_holdings(data_dir)
-    fac = factors.load_snapshot(data_dir) or pd.DataFrame()
-    vol = volume.load_latest(data_dir) or pd.DataFrame()
-    opts = options.load_latest(data_dir) or pd.DataFrame()
-    etf = etf_flows.load_latest(data_dir) or pd.DataFrame()
+    fac = snowflake_factors.load_snapshot(data_dir)
+    fac = fac if fac is not None else pd.DataFrame()
+    vol = snowflake_price_volume.load_latest(data_dir)
+    vol = vol if vol is not None else pd.DataFrame()
+    crowd = snowflake_crowding.load_signals(data_dir)
+    crowd = crowd if crowd is not None else pd.DataFrame()
+    opts = options.load_latest(data_dir)
+    opts = opts if opts is not None else pd.DataFrame()
+    etf = etf_flows.load_latest(data_dir)
+    etf = etf if etf is not None else pd.DataFrame()
 
     if holdings is None or holdings.empty:
         click.echo("Error: No data. Run 'pressure ingest' first.", err=True)
@@ -343,7 +375,7 @@ def detail(ctx, ticker):
     agg_resid = residual.aggregate_residuals(resid)
     ownership = residual.compute_ownership_concentration(holdings)
 
-    vol_features = volume_model.build_volume_features(agg_resid, fac, vol, opts)
+    vol_features = volume_model.build_volume_features(agg_resid, fac, vol, opts, crowd)
     vol_preds = volume_model.predict_volume_spikes(vol_features)
 
     results = pressure_score.compute_pressure_scores(
@@ -355,6 +387,7 @@ def detail(ctx, ticker):
         ownership_changes=ownership,
         volume_predictions=vol_preds,
         holdings=holdings,
+        crowding_signals=crowd,
     )
 
     # Find the specific ticker
@@ -364,6 +397,95 @@ def detail(ctx, ticker):
         return
 
     report.print_detail_report(target[0])
+
+
+@cli.command()
+@click.option("--ticker", default=None, help="Filter to a specific ticker")
+@click.option("--institution", default=None, help="Filter to a specific institution")
+@click.option("--all-quarters", is_flag=True, help="Show all quarters, not just the latest")
+@click.pass_context
+def converge(ctx, ticker, institution, all_quarters):
+    """Trade convergence analysis — reverse-engineer how institutions trade.
+
+    Transposes 13F trades against Axioma factor exposures, then checks
+    direction vs unusual volume, vs the factors each institution is known
+    to trade on, and vs similar historical quarters. When everything
+    converges, you know how they're trading. Also shows the market impact
+    of each factor and each player.
+    """
+    data_dir = ctx.obj["data_dir"]
+    snowflake_cfg = ctx.obj["snowflake"]
+
+    holdings = edgar_13f.load_holdings(data_dir)
+    factor_history = snowflake_factors.load_history(data_dir)
+
+    if holdings is None or holdings.empty:
+        click.echo("Error: No holdings data. Run 'pressure ingest' first.", err=True)
+        sys.exit(1)
+    if factor_history is None or factor_history.empty:
+        click.echo("Error: No Axioma factor history. Run 'pressure ingest' first.", err=True)
+        sys.exit(1)
+
+    # Optional filters
+    if ticker:
+        ticker = ticker.upper()
+        holdings = holdings[holdings["ticker"] == ticker]
+        if holdings.empty:
+            click.echo(f"No holdings data for {ticker}", err=True)
+            sys.exit(1)
+    if institution:
+        institution = institution.lower()
+        holdings = holdings[holdings["institution"] == institution]
+        if holdings.empty:
+            click.echo(f"No holdings data for institution '{institution}'", err=True)
+            sys.exit(1)
+
+    # Volume profiles per ticker-quarter (Snowflake-backed, cached)
+    click.echo("Loading volume profiles...")
+    volume_profiles = cache.load(data_dir, accumulation.NAMESPACE, "historical_profiles")
+    if volume_profiles is None:
+        click.echo("  No cached profiles — building from Snowflake (this may take a while)")
+        volume_profiles = accumulation.build_profiles_from_cache(
+            holdings, data_dir, snowflake_cfg
+        )
+
+    # Daily histories for quarterly returns + dollar volume
+    click.echo("Pulling daily market data from Snowflake...")
+    import datetime as dt
+    tickers_needed = list(holdings["ticker"].unique())
+    end = dt.date.today() + dt.timedelta(days=1)
+    daily_histories = snowflake_price_volume.get_all_histories(
+        tickers_needed, "2014-01-01", end.isoformat(), snowflake_cfg
+    )
+
+    click.echo("Running convergence analysis...")
+    results = convergence.run_convergence_analysis(
+        holdings=holdings,
+        factor_history=factor_history,
+        volume_profiles=volume_profiles if volume_profiles is not None else pd.DataFrame(),
+        daily_histories=daily_histories,
+    )
+
+    if results["panel"].empty:
+        click.echo("No overlapping trade-factor data to analyze.")
+        return
+
+    report.print_convergence_report(
+        results["panel"],
+        results["readability"],
+        results["factor_impacts"],
+        results["player_impacts"],
+        latest_only=not all_quarters,
+    )
+
+    md_path = report.generate_convergence_markdown(
+        results["panel"],
+        results["readability"],
+        results["factor_impacts"],
+        results["player_impacts"],
+        f"{data_dir}/reports/convergence_latest.md",
+    )
+    click.echo(f"Report saved to {md_path}")
 
 
 @cli.command("analyze-factors")

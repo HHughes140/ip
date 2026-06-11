@@ -282,30 +282,31 @@ def build_historical_profiles(
 def build_profiles_from_cache(
     holdings: pd.DataFrame,
     data_dir: str,
+    snowflake_cfg: dict,
 ) -> pd.DataFrame:
-    """Build profiles using yfinance, with caching.
+    """Build profiles using Snowflake daily data, with caching.
 
-    This is the default path — uses yfinance to fetch historical daily
-    data for each quarter in the 13F history.
+    Fetches full daily history per ticker from Snowflake once, then slices
+    per quarter to compute volume profiles.
     """
-    import yfinance as yf
+    from src.data import snowflake_price_volume
 
     cached = cache.load(data_dir, NAMESPACE, "historical_profiles")
     if cached is not None:
         return cached
 
-    # Build a price fetcher that caches per-ticker history
+    # Fetch per-ticker history lazily, cached for the run
     _price_cache: dict[str, pd.DataFrame] = {}
 
     def _fetch(ticker: str, start: str, end: str) -> pd.DataFrame:
         if ticker not in _price_cache:
             try:
-                t = yf.Ticker(ticker)
-                hist = t.history(start="2014-01-01", period="max", auto_adjust=True)
-                if not hist.empty:
-                    hist.index = hist.index.tz_localize(None)
-                _price_cache[ticker] = hist
-            except Exception:
+                _price_cache[ticker] = snowflake_price_volume.get_ticker_history(
+                    ticker, "2014-01-01", pd.Timestamp.now().strftime("%Y-%m-%d"),
+                    snowflake_cfg,
+                )
+            except Exception as e:
+                logger.warning("Snowflake history fetch failed for %s: %s", ticker, e)
                 _price_cache[ticker] = pd.DataFrame()
 
         hist = _price_cache.get(ticker, pd.DataFrame())
@@ -313,8 +314,7 @@ def build_profiles_from_cache(
             return pd.DataFrame()
 
         mask = (hist.index >= start) & (hist.index < end)
-        subset = hist.loc[mask, ["Volume", "Close"]]
-        return subset
+        return hist.loc[mask, ["Volume", "Close"]]
 
     profiles = build_historical_profiles(holdings, _fetch)
 

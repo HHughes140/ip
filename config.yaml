@@ -3,6 +3,21 @@
 fred:
   api_key: "YOUR_FRED_API_KEY_HERE"
 
+# Snowflake data warehouse (price/volume, Axioma factors, crowding)
+# Auth is handled by src/data/snowflake_utilities.py (RSA key-pair via
+# SNOWFLAKE_PRIVATE_KEY_FILE env var).
+snowflake:
+  warehouse: "WHSE_TEAM_WILHELM_001"
+  database: "DB_TEAM_WILHELM_001"
+  schema: "PUBLIC"
+  tables:
+    # Daily OHLCV per ticker: ticker, date, open, high, low, close, volume
+    price_volume: "FILL_ME_IN"
+    # Daily Axioma factor exposures per ticker: ticker, date, + factor columns
+    axioma_factors: "FILL_ME_IN"
+    # Crowding scores per ticker/date/provider: ticker, date, provider, crowding_score
+    crowding: "FILL_ME_IN"
+
 # Historical lookback
 history:
   start_year: 2015
